@@ -9,6 +9,7 @@
 from __future__ import division
 
 import warnings
+import random
 from random import Random
 import io
 import os
@@ -26,7 +27,7 @@ from PIL import ImageColor
 from PIL import ImageDraw
 from PIL import ImageFilter
 from PIL import ImageFont
-
+import cv2
 from .query_integral_image import query_integral_image
 from .tokenization import unigrams_and_bigrams, process_tokens
 
@@ -160,7 +161,7 @@ class WordCloud(object):
         Font path to the font that will be used (OTF or TTF).
         Defaults to DroidSansMono path on a Linux machine. If you are on
         another OS or don't have this font, you need to adjust this path.
-
+    multiply_random_font: Random font. If True -> font_path must be a list
     width : int (default=400)
         Width of the canvas.
 
@@ -290,11 +291,9 @@ class WordCloud(object):
         .. versionchanged: 2.0
             ``words_`` is now a dictionary
 
-    ``layout_`` : list of tuples ((string, float), int, (int, int), int, color))
-        Encodes the fitted word cloud. For each word, it encodes the string, 
-        normalized frequency, font size, position, orientation, and color.
-        The frequencies are normalized by the most commonly occurring word.
-        The color is in the format of 'rgb(R, G, B).'
+    ``layout_`` : list of tuples (string, int, (int, int), int, color))
+        Encodes the fitted word cloud. Encodes for each word the string, font
+        size, position, orientation and color.
 
     Notes
     -----
@@ -306,15 +305,16 @@ class WordCloud(object):
     scaling heuristic.
     """
 
-    def __init__(self, font_path=None, width=400, height=200, margin=2,
+    def __init__(self, font_path=None, multiply_random_font=False, width=400, height=200, margin=2,
                  ranks_only=None, prefer_horizontal=.9, mask=None, scale=1,
-                 color_func=None, max_words=200, min_font_size=4,
+                 color_func=None, color_value=(255, 0, 0), max_words=200, min_font_size=4,
                  stopwords=None, random_state=None, background_color='black',
                  max_font_size=None, font_step=1, mode="RGB",
                  relative_scaling='auto', regexp=None, collocations=True,
                  colormap=None, normalize_plurals=True, contour_width=0,
                  contour_color='black', repeat=False,
-                 include_numbers=False, min_word_length=0, collocation_threshold=30):
+                 include_numbers=False, min_word_length=0, collocation_threshold=30, keep_origin_word=False,
+                 multiply_color_choice=False, color_dict=None, random_rotate=False):
         if font_path is None:
             font_path = FONT_PATH
         if color_func is None and colormap is None:
@@ -326,6 +326,7 @@ class WordCloud(object):
         self.colormap = colormap
         self.collocations = collocations
         self.font_path = font_path
+        self.multiply_random_font = multiply_random_font
         self.width = width
         self.height = height
         self.margin = margin
@@ -346,7 +347,11 @@ class WordCloud(object):
         self.background_color = background_color
         self.max_font_size = max_font_size
         self.mode = mode
-
+        self.keep_origin_word = keep_origin_word
+        self.multiply_color_choice = multiply_color_choice
+        self.color_dict = color_dict
+        self.color_value = color_value
+        self.random_rotate = random_rotate
         if relative_scaling == "auto":
             if repeat:
                 relative_scaling = 0
@@ -366,11 +371,6 @@ class WordCloud(object):
         self.include_numbers = include_numbers
         self.min_word_length = min_word_length
         self.collocation_threshold = collocation_threshold
-
-        # Override the width and height if there is a mask
-        if mask is not None:
-            self.width = mask.shape[1]
-            self.height = mask.shape[0]
 
     def fit_words(self, frequencies):
         """Create a word_cloud from words and frequencies.
@@ -430,128 +430,306 @@ class WordCloud(object):
             boolean_mask = None
             height, width = self.height, self.width
         occupancy = IntegralOccupancyMap(height, width, boolean_mask)
+        font_sizes, positions, colors, font_paths, rotate_angles, horizon_boxes, rotated_boxes = [], [], [], [], [], [], []
+        if self.random_rotate:
+            # create image
+            img_grey = Image.new("L", (width, height))
+            draw = ImageDraw.Draw(img_grey)
+            img_array = np.asarray(img_grey)
+            last_freq = 1.
+            if max_font_size is None:
+                # if not provided use default font_size
+                max_font_size = self.max_font_size
 
-        # create image
-        img_grey = Image.new("L", (width, height))
-        draw = ImageDraw.Draw(img_grey)
-        img_array = np.asarray(img_grey)
-        font_sizes, positions, orientations, colors = [], [], [], []
-
-        last_freq = 1.
-
-        if max_font_size is None:
-            # if not provided use default font_size
-            max_font_size = self.max_font_size
-
-        if max_font_size is None:
-            # figure out a good font size by trying to draw with
-            # just the first two words
-            if len(frequencies) == 1:
-                # we only have one word. We make it big!
-                font_size = self.height
-            else:
-                self.generate_from_frequencies(dict(frequencies[:2]),
-                                               max_font_size=self.height)
-                # find font sizes
-                sizes = [x[1] for x in self.layout_]
-                try:
-                    font_size = int(2 * sizes[0] * sizes[1]
-                                    / (sizes[0] + sizes[1]))
-                # quick fix for if self.layout_ contains less than 2 values
-                # on very small images it can be empty
-                except IndexError:
-                    try:
-                        font_size = sizes[0]
-                    except IndexError:
-                        raise ValueError(
-                            "Couldn't find space to draw. Either the Canvas size"
-                            " is too small or too much of the image is masked "
-                            "out.")
-        else:
-            font_size = max_font_size
-
-        # we set self.words_ here because we called generate_from_frequencies
-        # above... hurray for good design?
-        self.words_ = dict(frequencies)
-
-        if self.repeat and len(frequencies) < self.max_words:
-            # pad frequencies with repeating words.
-            times_extend = int(np.ceil(self.max_words / len(frequencies))) - 1
-            # get smallest frequency
-            frequencies_org = list(frequencies)
-            downweight = frequencies[-1][1]
-            for i in range(times_extend):
-                frequencies.extend([(word, freq * downweight ** (i + 1))
-                                    for word, freq in frequencies_org])
-
-        # start drawing grey image
-        for word, freq in frequencies:
-            if freq == 0:
-                continue
-            # select the font size
-            rs = self.relative_scaling
-            if rs != 0:
-                font_size = int(round((rs * (freq / float(last_freq))
-                                       + (1 - rs)) * font_size))
-            if random_state.random() < self.prefer_horizontal:
-                orientation = None
-            else:
-                orientation = Image.ROTATE_90
-            tried_other_orientation = False
-            while True:
-                # try to find a position
-                font = ImageFont.truetype(self.font_path, font_size)
-                # transpose font optionally
-                transposed_font = ImageFont.TransposedFont(
-                    font, orientation=orientation)
-                # get size of resulting text
-                box_size = draw.textsize(word, font=transposed_font)
-                # find possible places using integral image:
-                result = occupancy.sample_position(box_size[1] + self.margin,
-                                                   box_size[0] + self.margin,
-                                                   random_state)
-                if result is not None or font_size < self.min_font_size:
-                    # either we found a place or font-size went too small
-                    break
-                # if we didn't find a place, make font smaller
-                # but first try to rotate!
-                if not tried_other_orientation and self.prefer_horizontal < 1:
-                    orientation = (Image.ROTATE_90 if orientation is None else
-                                   Image.ROTATE_90)
-                    tried_other_orientation = True
+            if max_font_size is None:
+                # figure out a good font size by trying to draw with
+                # just the first two words
+                if len(frequencies) == 1:
+                    # we only have one word. We make it big!
+                    font_size = self.height
                 else:
+                    self.generate_from_frequencies(dict(frequencies[:2]),
+                                                   max_font_size=self.height)
+                    # find font sizes
+                    sizes = [x[1] for x in self.layout_]
+                    try:
+                        font_size = int(2 * sizes[0] * sizes[1]
+                                        / (sizes[0] + sizes[1]))
+                    # quick fix for if self.layout_ contains less than 2 values
+                    # on very small images it can be empty
+                    except IndexError:
+                        try:
+                            font_size = sizes[0]
+                        except IndexError:
+                            raise ValueError(
+                                "Couldn't find space to draw. Either the Canvas size"
+                                " is too small or too much of the image is masked "
+                                "out.")
+            else:
+                font_size = max_font_size
+
+            # we set self.words_ here because we called generate_from_frequencies
+            # above... hurray for good design?
+            self.words_ = dict(frequencies)
+
+            if self.repeat and len(frequencies) < self.max_words:
+                # pad frequencies with repeating words.
+                times_extend = int(np.ceil(self.max_words / len(frequencies))) - 1
+                # get smallest frequency
+                frequencies_org = list(frequencies)
+                downweight = frequencies[-1][1]
+                for i in range(times_extend):
+                    frequencies.extend([(word, freq * downweight ** (i + 1))
+                                        for word, freq in frequencies_org])
+
+            # start drawing grey image
+            for word, freq in frequencies:
+                if freq == 0:
+                    continue
+                # select the font size
+                rs = self.relative_scaling
+                if rs != 0:
+                    font_size = int(round((rs * (freq / float(last_freq))
+                                           + (1 - rs)) * font_size))
+                tried_other_orientation = False
+                if self.multiply_random_font:
+                    fp = random.choice(self.font_path)
+                else:
+                    fp = self.font_path
+                if self.random_rotate:
+                    rotate_angle = random.randint(-30, 30)
+                else:
+                    rotate_angle = 0
+                while True:
+                    # try to find a position
+                    font = ImageFont.truetype(fp, font_size)
+                    # transpose font optionally
+                    transposed_font = ImageFont.TransposedFont(
+                        font, orientation=None)
+                    # get size of resulting text
+                    box_size = draw.textsize(word, font=transposed_font)## 0: width. 1: height
+                    # find new bouding box size and delta
+                    if self.random_rotate:
+                        new_box_size, delta = self.rotate_box(box_size[0], box_size[1], rotate_angle)
+                    else:
+                        new_box_size = box_size
+                        delta = (0, 0)
+                    # find possible places using integral image:
+
+                    result = occupancy.sample_position(new_box_size[1] + self.margin,
+                                                       new_box_size[0] + self.margin,
+                                                       random_state)
+                    if result is not None or font_size < self.min_font_size:
+                        # either we found a place or font-size went too small
+                        break
+                    # if we didn't find a place, make font smaller
+                    # but first try to rotate!
+                    font_size -= self.font_step
+                    orientation = None
+                if font_size < self.min_font_size:
+                    # we were unable to draw any more
+                    break
+                # reduce delta
+                y, x = np.array(result)
+                x, y = int(x + delta[0])  + self.margin // 2, int(y + delta[1])  + self.margin // 2
+                # actually draw the text
+
+                positions.append((x, y))
+                font_sizes.append(font_size)
+                font_paths.append(fp)
+                if self.multiply_color_choice:
+                    colors.append(self.color_dict[word])
+                else:
+                    colors.append(self.color_func(self.color_value))
+
+                # recompute integral image
+                horizon_box = (x, y, box_size[0], box_size[1])
+                rotated_box = (result[1] + self.margin // 2, result[0] + self.margin // 2, new_box_size[0], new_box_size[1])
+                horizon_boxes.append(horizon_box)
+                rotated_boxes.append(rotated_box)
+                rotate_angles.append(rotate_angle)
+                # draw.text((x, y), word, fill="white", font=transposed_font)
+                tmp_1 = Image.fromarray(np.zeros((horizon_box[3], horizon_box[2]), np.uint8))
+                draw_1 = ImageDraw.Draw(tmp_1)
+                draw_1.text((0, 0), word, fill="white", font=transposed_font)
+
+                if self.mask is None:
+                    img_array = np.asarray(img_grey)
+                else:
+                    img_array = np.asarray(img_grey) + boolean_mask
+                #
+                # crop_image = img_array[horizon_box[1]: horizon_box[1]+horizon_box[3], horizon_box[0]: horizon_box[0]+horizon_box[2]]
+                crop_image = np.asarray(tmp_1)
+
+                rotated_image = self.rotate_bound(crop_image, rotate_angle)
+                if rotated_image.shape[1] != rotated_box[2] or rotated_image.shape[0] != rotated_box[3]:
+                    rotated_image = cv2.resize(rotated_image, (rotated_box[2], rotated_box[3]))
+
+                tmp_2 = Image.fromarray(rotated_image)
+                # img_grey.paste(tmp_1, (horizon_box[0], horizon_box[1]))
+                img_grey.paste(tmp_2, (rotated_box[0], rotated_box[1]))
+                img_array[rotated_box[1]: rotated_box[1] + rotated_box[3],
+                rotated_box[0]: rotated_box[0] + rotated_box[2]] = rotated_image
+                # recompute bottom right
+                # the order of the cumsum's is important for speed ?!
+                occupancy.update(img_array, rotated_box[1], rotated_box[0])
+                last_freq = freq
+
+            self.layout_ = list(zip(frequencies, font_sizes, positions,
+                                    colors, font_paths, rotate_angles, horizon_boxes, rotated_boxes))
+            return self
+        else:
+            # create image
+            img_grey = Image.new("L", (width, height))
+            draw = ImageDraw.Draw(img_grey)
+            last_freq = 1.
+            if max_font_size is None:
+                # if not provided use default font_size
+                max_font_size = self.max_font_size
+
+            if max_font_size is None:
+                # figure out a good font size by trying to draw with
+                # just the first two words
+                if len(frequencies) == 1:
+                    # we only have one word. We make it big!
+                    font_size = self.height
+                else:
+                    self.generate_from_frequencies(dict(frequencies[:2]),
+                                                   max_font_size=self.height)
+                    # find font sizes
+                    sizes = [x[1] for x in self.layout_]
+                    try:
+                        font_size = int(2 * sizes[0] * sizes[1]
+                                        / (sizes[0] + sizes[1]))
+                    # quick fix for if self.layout_ contains less than 2 values
+                    # on very small images it can be empty
+                    except IndexError:
+                        try:
+                            font_size = sizes[0]
+                        except IndexError:
+                            raise ValueError(
+                                "Couldn't find space to draw. Either the Canvas size"
+                                " is too small or too much of the image is masked "
+                                "out.")
+            else:
+                font_size = max_font_size
+
+            # we set self.words_ here because we called generate_from_frequencies
+            # above... hurray for good design?
+            self.words_ = dict(frequencies)
+
+            if self.repeat and len(frequencies) < self.max_words:
+                # pad frequencies with repeating words.
+                times_extend = int(np.ceil(self.max_words / len(frequencies))) - 1
+                # get smallest frequency
+                frequencies_org = list(frequencies)
+                downweight = frequencies[-1][1]
+                for i in range(times_extend):
+                    frequencies.extend([(word, freq * downweight ** (i + 1))
+                                        for word, freq in frequencies_org])
+
+            # start drawing grey image
+            for word, freq in frequencies:
+                if freq == 0:
+                    continue
+                # select the font size
+                rs = self.relative_scaling
+                if rs != 0:
+                    font_size = int(round((rs * (freq / float(last_freq))
+                                           + (1 - rs)) * font_size))
+
+                if self.multiply_random_font:
+                    fp = random.choice(self.font_path)
+                else:
+                    fp = self.font_path
+
+                while True:
+                    # try to find a position
+                    font = ImageFont.truetype(fp, font_size)
+                    # transpose font optionally
+                    transposed_font = ImageFont.TransposedFont(
+                        font)
+                    # get size of resulting text
+                    box_size = draw.textsize(word, font=transposed_font)
+                    # find possible places using integral image:
+                    result = occupancy.sample_position(box_size[1] + self.margin,
+                                                       box_size[0] + self.margin,
+                                                       random_state)
+                    if result is not None or font_size < self.min_font_size:
+                        # either we found a place or font-size went too small
+                        break
+                    # if we didn't find a place, make font smaller
+                    # but first try to rotate!
+
                     font_size -= self.font_step
                     orientation = None
 
-            if font_size < self.min_font_size:
-                # we were unable to draw any more
-                break
+                if font_size < self.min_font_size:
+                    # we were unable to draw any more
+                    break
 
-            x, y = np.array(result) + self.margin // 2
-            # actually draw the text
-            draw.text((y, x), word, fill="white", font=transposed_font)
-            positions.append((x, y))
-            orientations.append(orientation)
-            font_sizes.append(font_size)
-            colors.append(self.color_func(word, font_size=font_size,
-                                          position=(x, y),
-                                          orientation=orientation,
-                                          random_state=random_state,
-                                          font_path=self.font_path))
-            # recompute integral image
-            if self.mask is None:
-                img_array = np.asarray(img_grey)
-            else:
-                img_array = np.asarray(img_grey) + boolean_mask
-            # recompute bottom right
-            # the order of the cumsum's is important for speed ?!
-            occupancy.update(img_array, x, y)
-            last_freq = freq
+                y, x = np.array(result) + self.margin // 2
+                # actually draw the text
+                draw.text((x, y), word, fill="white", font=transposed_font)
+                positions.append((x, y))
+                font_sizes.append(font_size)
+                font_paths.append(fp)
+                if self.multiply_color_choice:
+                    colors.append(self.color_dict[word])
+                else:
+                    colors.append(self.color_func(self.color_value))
+                # recompute integral image
+                if self.mask is None:
+                    img_array = np.asarray(img_grey)
+                else:
+                    img_array = np.asarray(img_grey) + boolean_mask
+                # recompute bottom right
+                # the order of the cumsum's is important for speed ?!
+                occupancy.update(img_array, y, x)
+                last_freq = freq
 
-        self.layout_ = list(zip(frequencies, font_sizes, positions,
-                                orientations, colors))
-        return self
+            self.layout_ = list(zip(frequencies, font_sizes, positions, colors, font_paths))
+            return self
 
+    def rotate_bound(self, image, angle):
+        # grab the dimensions of the image and then determine the
+        # center
+        (h, w) = image.shape[:2]
+        (cX, cY) = (w / 2, h / 2)
+
+        # grab the rotation matrix (applying the negative of the
+        # angle to rotate clockwise), then grab the sine and cosine
+        # (i.e., the rotation components of the matrix)
+        M = cv2.getRotationMatrix2D((cX, cY), -angle, 1.0)
+        cos = np.abs(M[0, 0])
+        sin = np.abs(M[0, 1])
+
+        # compute the new bounding dimensions of the image
+        nW = int((h * sin) + (w * cos))
+        nH = int((h * cos) + (w * sin))
+
+        # adjust the rotation matrix to take into account translation
+        M[0, 2] += (nW / 2) - cX
+        M[1, 2] += (nH / 2) - cY
+
+        # perform the actual rotation and return the image
+        return cv2.warpAffine(image, M, (nW, nH))
+    def rotate_box(self, widht, height, angle):
+        (cX, cY) = (widht / 2, height / 2)
+
+        # grab the rotation matrix (applying the negative of the
+        # angle to rotate clockwise), then grab the sine and cosine
+        # (i.e., the rotation components of the matrix)
+        M = cv2.getRotationMatrix2D((cX, cY), -angle, 1.0)
+        cos = np.abs(M[0, 0])
+        sin = np.abs(M[0, 1])
+
+        # compute the new bounding dimensions of the image
+        nW = int((height * sin) + (widht * cos))
+        nH = int((height * cos) + (widht * sin))
+        new_cX, new_cY = (nW / 2, nH / 2)
+        (delta_x, delta_y) = (new_cX - cX, new_cY - cY)
+        return (nW, nH), (delta_x, delta_y)
     def process_text(self, text):
         """Splits a long text into words, eliminates the stopwords.
 
@@ -573,32 +751,37 @@ class WordCloud(object):
         There are better ways to do word tokenization, but I don't want to
         include all those things.
         """
-
-        flags = (re.UNICODE if sys.version < '3' and type(text) is unicode  # noqa: F821
-                 else 0)
-        pattern = r"\w[\w']*" if self.min_word_length <= 1 else r"\w[\w']+"
-        regexp = self.regexp if self.regexp is not None else pattern
-
-        words = re.findall(regexp, text, flags)
-        # remove 's
-        words = [word[:-2] if word.lower().endswith("'s") else word
-                 for word in words]
-        # remove numbers
-        if not self.include_numbers:
-            words = [word for word in words if not word.isdigit()]
-        # remove short words
-        if self.min_word_length:
-            words = [word for word in words if len(word) >= self.min_word_length]
-
-        stopwords = set([i.lower() for i in self.stopwords])
-        if self.collocations:
-            word_counts = unigrams_and_bigrams(words, stopwords, self.normalize_plurals, self.collocation_threshold)
+        if self.keep_origin_word:
+            word_counts = {
+                text: 1
+            }
+            return word_counts
         else:
-            # remove stopwords
-            words = [word for word in words if word.lower() not in stopwords]
-            word_counts, _ = process_tokens(words, self.normalize_plurals)
+            flags = (re.UNICODE if sys.version < '3' and type(text) is unicode  # noqa: F821
+                     else 0)
+            pattern = r"\w[\w']*" if self.min_word_length <= 1 else r"\w[\w']+"
+            regexp = self.regexp if self.regexp is not None else pattern
 
-        return word_counts
+            words = re.findall(regexp, text, flags)
+            # remove 's
+            words = [word[:-2] if word.lower().endswith("'s") else word
+                     for word in words]
+            # remove numbers
+            if not self.include_numbers:
+                words = [word for word in words if not word.isdigit()]
+            # remove short words
+            if self.min_word_length:
+                words = [word for word in words if len(word) >= self.min_word_length]
+
+            stopwords = set([i.lower() for i in self.stopwords])
+            if self.collocations:
+                stopwords = {}
+                word_counts = unigrams_and_bigrams(words, stopwords, self.normalize_plurals, self.collocation_threshold)
+            else:
+                # remove stopwords
+                words = [word for word in words if word.lower() not in stopwords]
+                word_counts, s = process_tokens(words, self.normalize_plurals)
+            return word_counts
 
     def generate_from_text(self, text):
         """Generate wordcloud from text.
@@ -644,28 +827,48 @@ class WordCloud(object):
             raise ValueError("WordCloud has not been calculated, call generate"
                              " first.")
 
-    def to_image(self):
+    def to_image(self, ):
         self._check_generated()
+
         if self.mask is not None:
             width = self.mask.shape[1]
             height = self.mask.shape[0]
         else:
             height, width = self.height, self.width
+        if self.random_rotate is False:
+            img = Image.new(self.mode, (int(width * self.scale),
+                                        int(height * self.scale)))
+            draw = ImageDraw.Draw(img)
+            for (word, count), font_size, position, color, fp in self.layout_:
+                font = ImageFont.truetype(fp,
+                                          int(font_size * self.scale))
+                transposed_font = ImageFont.TransposedFont(
+                    font, orientation=None)
+                pos = (int(position[0] * self.scale),
+                       int(position[1] * self.scale))
+                draw.text(pos, word, fill=color, font=transposed_font)
 
-        img = Image.new(self.mode, (int(width * self.scale),
-                                    int(height * self.scale)),
-                        self.background_color)
-        draw = ImageDraw.Draw(img)
-        for (word, count), font_size, position, orientation, color in self.layout_:
-            font = ImageFont.truetype(self.font_path,
-                                      int(font_size * self.scale))
-            transposed_font = ImageFont.TransposedFont(
-                font, orientation=orientation)
-            pos = (int(position[1] * self.scale),
-                   int(position[0] * self.scale))
-            draw.text(pos, word, fill=color, font=transposed_font)
+            return self._draw_contour(img=img)
+        else:
+            img = Image.new(self.mode, (int(width * self.scale),
+                                        int(height * self.scale)))
+            draw = ImageDraw.Draw(img)
 
-        return self._draw_contour(img=img)
+            for (word, count), font_size, position, color, font_path, rotate_angle, horizon_box, rotated_box in self.layout_:
+                font = ImageFont.truetype(font_path,
+                                          int(font_size * self.scale))
+                tmp_1 = Image.new(self.mode, (horizon_box[2] * self.scale, horizon_box[3] * self.scale))
+                draw_1 = ImageDraw.Draw(tmp_1)
+
+                transposed_font = ImageFont.TransposedFont(
+                    font, orientation=None)
+                draw_1.text((0, 0), word, fill=color, font=transposed_font)
+                crop_image = np.array(tmp_1)
+                rotated_image = self.rotate_bound(crop_image, angle=rotate_angle)
+                pos = (rotated_box[0] * self.scale, rotated_box[1] * self.scale)
+                tmp_2 = Image.fromarray(rotated_image)
+                img.paste(tmp_2, pos)
+            return self._draw_contour(img=img)
 
     def recolor(self, random_state=None, color_func=None, colormap=None):
         """Recolor existing layout.
