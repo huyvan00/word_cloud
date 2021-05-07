@@ -41,7 +41,7 @@ class IntegralOccupancyMap(object):
 
 
 class ImageCloud(object):
-    def __init__(self, shape_mask, list_image=None, max_height=100, min_height=30, random_rotate=True, margin=0, height_step=2):
+    def __init__(self, shape_mask, list_image=None, idx_choice = None, max_height=100, min_height=30, random_rotate=True, margin=0, height_step=2):
         self.shape_mask = shape_mask
         self.list_image = list_image
         self.max_height = max_height
@@ -49,6 +49,7 @@ class ImageCloud(object):
         self.random_rotate = random_rotate
         self.margin = margin
         self.height_step = height_step
+        self.idx_choice = idx_choice
 
     def generate_from_image(self):
         random_state = Random()
@@ -60,12 +61,16 @@ class ImageCloud(object):
         image_idx, height_sizes, positions, rotate_angles = [], [], [], []
 
         height_size = self.max_height
+        if self.idx_choice is None:
+            idx_choice = range(len(self.list_image))
+        else:
+            idx_choice = self.idx_choice
         while True:
             if self.random_rotate:
                 rotate_angle = random.randint(-30, 30)
             else:
                 rotate_angle = 0
-            index = random.choice(range(len(self.list_image)))
+            index = random.choice(idx_choice)
 
             while True:
 
@@ -101,8 +106,8 @@ class ImageCloud(object):
             positions.append((x, y))
             rotate_angles.append(rotate_angle)
         layout_ = list(zip(image_idx, positions, height_sizes, rotate_angles))
-
-        return layout_
+        output_mask = np.uint8(boolean_mask*255)
+        return layout_, output_mask
 
     def rotate_bound(self, image, angle):
         # grab the dimensions of the image and then determine the
